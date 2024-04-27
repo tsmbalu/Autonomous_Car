@@ -1,28 +1,23 @@
 import numpy as np
 import cv2
-
-from traffic_signal_controller import TrafficSignalController
+import time
 
 
 class LaneController:
     def __init__(self, debug=False):
         # state of lane controller
         self.mode = 'driving'
-        self.ts = TrafficSignalController(debug=debug)
         self.turn_counter = 0
-
+        self.previous_state = ''
+        self.green_timer = 0
+        
         # some (static) parameters of the controller
         self.steering_row = 47
-        self.crossroad_row = 45
+        self.crossroad_row = 43
 
-        self.max_steering_angle = 0.3
-        self.max_speed = 40
+        self.max_steering_angle = 0.15
+        self.max_speed = 50
         self.min_speed = 25
-
-        self.traffic_signal = ''
-        self.previous_mode = ''
-        self.speed_mode = 'normal'
-        self.green_signal_step_counter = 0
 
         # flag for debugging
         self.debug = debug
@@ -39,7 +34,7 @@ class LaneController:
         image[self.crossroad_row, :] = 1.0 - image[self.crossroad_row, :]  # mark crossroad row
 
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(name, image.shape[1] * scale, image.shape[0] * scale)
+        cv2.resizeWindow(name, image.shape[1]*scale, image.shape[0]*scale)
         cv2.imshow(name, image)
         cv2.waitKey(1)
 
@@ -100,12 +95,12 @@ class LaneController:
         this method calculates a steering angle based on the center of the road.
         """
         if road_center is None:
-            return 0
-
+            return self.steering_angle
+            
         # try and keep road center on the left
         preferred_road_center_pos = -0.15
         angle = road_center - preferred_road_center_pos
-
+        
         angle = np.clip(angle, -self.max_steering_angle, self.max_steering_angle)
         return angle
 
@@ -118,63 +113,83 @@ class LaneController:
         speed_factor = (self.max_steering_angle - abs(steering_angle)) / self.max_steering_angle
         # linearly interpolate between min and max speed
         speed = (self.max_speed - self.min_speed) * speed_factor + self.min_speed
-        return speed
-
+        return speed    
+                       
+    def traffic_light_red(self,image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        #detect for red signal
+        red_lower1 = np.array([0, 100, 20], np.uint8)
+        red_upper1 = np.array([10, 255, 255], np.uint8)
+        red_lower2 = np.array([160, 100, 20], np.uint8)
+        red_upper2 = np.array([179, 255, 255], np.uint8)
+        mask_red1 = cv2.inRange(hsv, red_lower1, red_upper1)
+        mask_red2 = cv2.inRange(hsv, red_lower2, red_upper2)
+        red_mask = mask_red1 + mask_red2
+        red_pixels = np.argwhere(red_mask !=0)
+        
+        
+        for red_pixel in red_pixels: 
+            if red_pixel[1]>54 and np.count_nonzero(red_mask) <= 2:
+                return True
+            else:
+                return False
+                
+    def detect_turning_yellow_board(self,image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower = np.array([25, 100, 100], np.uint8)
+        upper = np.array([50, 255, 255], np.uint8)
+        mask_yellow_board = cv2.inRange(hsv, lower, upper).astype(bool)
+        return np.any(mask_yellow_board)        
+        
+        
+    def traffic_light_green(self,image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        glower1 = np.array([60, 100, 100], np.uint8)
+        gupper1 = np.array([80, 255, 255], np.uint8)
+        mask_green1 = cv2.inRange(hsv, glower1, gupper1)
+        
+        return np.any(mask_green1) and np.count_nonzero(mask_green1) <= 3
+        
     def predict_angle_and_speed(self, image):
         """
         this is the main function of the lane controller.
-        it takes an image and returns a steering angle and a speed.
+        it takes an image and returns a steering angleolor and a speed.
         """
         steering_angle = 0
-
-        if self.green_signal_step_counter <= 0:
-            self.traffic_signal = self.ts.get_traffic_signal(image)
-
+        self.green_timer += 1
+        right_side_image = image[23:40, 30:128]
+        
+        # Show Cropped Right Side Image
+        if self.debug:
+            cv2.namedWindow('Traffic Light', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Traffic Light', right_side_image.shape[1]*2, right_side_image.shape[0]*2)
+            cv2.imshow('Traffic Light', right_side_image)
+        
         """
-            In this scenario, the car must stop when the traffic signal is red and start moving when it is green. 
-            Identifying the current state of the traffic signal and acting accordingly is essential. 
-            Local sensing is appropriate for this purpose. 
-            
-            The adapted behaviour follows the Subsumption method. If the car senses a red signal, 
-            the stop behaviour overrides the driving behaviour. Similarly, when the car is in stop mode and 
-            senses a green signal, the driving mode overrides the stop mode. 
-            Hence, the Subsumption behaviour approach is employed in this scenario.
+            In the Traffic light detection the car should stop in "red" and go in "green"so here I am using 
+            subsumption behaviour to detect the signals in that subsumption using state machine. For instance
+            each mode of car such as driving, stop, turning left and turning right are state and based 
+            on the detection of the signal and cross road corresponding state is selected and when the signal is red the car will stop and take some time until for green signal then start to move. 
         """
-
-        # If the signal is red and mode is not stop, then switch mode to stop
-        # and save the current mode to resume after green signal
-        if self.traffic_signal == 'Red' and self.mode != 'stop':
+        if self.green_timer > 300 and self.mode == 'stop' and self.traffic_light_green(right_side_image):
             if self.debug:
-                print(f"Traffic Light: Red detected. Stop {self.previous_mode}")
-            self.previous_mode = self.mode
+                print('Green detected')
+            self.green_timer = 0
+            self.mode = self.previous_state
+            self.previous_state = ''
+        elif self.green_timer > 300 and self.mode != 'stop' and self.traffic_light_red(right_side_image):
+            if self.debug:
+                print('Red detected')
+            self.previous_state = self.mode
             self.mode = 'stop'
-        # If the signal is green and mode is stop, then resume the previous mode.
-        elif self.traffic_signal == 'Green' and self.mode == 'stop':
-            if self.debug:
-                print(f"Traffic Light: Green detected. Resume {self.previous_mode}")
-            self.mode = self.previous_mode
-            self.previous_mode = ''
-            # After Green Signal Detected, No slow down for 200 step even traffic signal post detected
-            self.green_signal_step_counter = 200
-
-        # Start decrement the green signal step counter
-        self.green_signal_step_counter -= 1
-
-        # If the traffic signal post detected and mode is not stop and traffic signal is not green
-        # then reduce the car speed to detect the color of traffic signal
-        if (self.ts.is_traffic_signal_detected and self.mode != 'stop' and self.traffic_signal != 'Green'
-                and self.green_signal_step_counter <= 0):
-            self.speed_mode = 'slow'
-        else:
-            self.speed_mode = 'normal'
-
+        
         if self.mode == 'turning_left':
             # MODE 'turning_left': make a (blind) turn at a crossroads based on time passed
             self.turn_counter += 1
-            if self.turn_counter < 90:
+            if self.turn_counter < 45:
                 # keep going straight first to ensure we're on the crossroads
                 steering_angle = 0
-            elif self.turn_counter < 190:
+            elif self.turn_counter < 120:
                 # actually make the turn
                 steering_angle = -self.max_steering_angle
             else:
@@ -183,14 +198,14 @@ class LaneController:
                 self.turn_counter = 0
                 if self.debug:
                     print('finished turn, back to normal driving!')
-
+                    
         elif self.mode == 'turning_right':
             # MODE 'turning_right': make a (blind) turn at a crossroads based on time passed
             self.turn_counter += 1
-            if self.turn_counter < 110:
+            if self.turn_counter < 30:
                 # keep going straight first to ensure we're on the crossroads
                 steering_angle = 0
-            elif self.turn_counter < 160:
+            elif self.turn_counter < 100:
                 # actually make the turn
                 steering_angle = self.max_steering_angle
             else:
@@ -217,22 +232,23 @@ class LaneController:
             # check if we need to make a turn
             if self._at_crossroads(road_image):
                 # at crossroads -> change to MODE turning
-                self.mode = np.random.choice(['turning_right', 'turning_left'])
+                self.mode = np.random.choice(['turning_left', 'turning_right'])
 
                 if self.debug:
                     print(f'crossroads detected! {self.mode}')
-
+        
         elif self.mode == 'stop':
             return 0, 0
 
         else:
             # unknown mode, if this happens we made a programming mistake
             raise ValueError(f'unknown mode: {self.mode}')
-
-        if self.speed_mode == 'slow':
-            speed = 10
+    
+        # in both modes, we smoothen the steering angle and adjust the speed accordingly
+        if self.detect_turning_yellow_board(right_side_image):
+            speed = 30
         else:
-            # in both driving and turning modes, we smoothen the steering angle and adjust the speed accordingly
             speed = self._get_speed(steering_angle)
+            
 
         return steering_angle, speed
